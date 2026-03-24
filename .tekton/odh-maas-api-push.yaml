@@ -28,10 +28,6 @@ spec:
     value: maas-api/Dockerfile
   - name: path-context
     value: maas-api
-  - name: hermetic
-    value: true
-  - name: prefetch-input
-    value: { "type": "gomod", "path": "maas-controller" }
   pipelineRef:
     resolver: git
     params:
