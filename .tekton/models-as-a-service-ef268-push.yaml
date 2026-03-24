@@ -29,6 +29,10 @@ spec:
     value: maas-controller/Dockerfile.konflux
   - name: path-context
     value: maas-controller
+  - name: hermetic
+    value: true
+  - name: prefetch-input
+    value: '[{ "type": "gomod", "path": "maas-controller" }]'
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.
