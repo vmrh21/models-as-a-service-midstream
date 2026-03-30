@@ -126,6 +126,14 @@ replacements:
     fieldPath: data.app-namespace
   targets:
   - select:
+      kind: AuthPolicy
+      name: maas-api-auth-policy
+    fieldPaths:
+    - spec.rules.metadata.apiKeyValidation.http.url
+    options:
+      delimiter: "."
+      index: 1
+  - select:
       kind: DestinationRule
       name: maas-api-backend-tls
     fieldPaths:
@@ -133,3 +141,13 @@ replacements:
     options:
       delimiter: "."
       index: 1
+  - select:
+      kind: ClusterRoleBinding
+      name: maas-controller-rolebinding
+    fieldPaths:
+    - subjects.0.namespace
+  - select:
+      kind: RoleBinding
+      name: maas-controller-leader-election-rolebinding
+    fieldPaths:
+    - subjects.0.namespace

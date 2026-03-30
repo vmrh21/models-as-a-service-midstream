@@ -11,9 +11,9 @@
 #   1. Install cert-manager and LeaderWorkerSet (LWS) operators (required for KServe)
 #   2. Deploy MaaS platform via kustomize (RHCL, gateway, MaaS API, maas-controller)
 #   3. Install OpenDataHub (ODH) operator with DataScienceCluster (KServe)
-#   4. Deploy MaaS system (free + premium + unconfigured: LLMIS + MaaSModelRef + MaaSAuthPolicy + MaaSSubscription)
+#   4. Deploy MaaS system (free + premium + e2e test fixtures: LLMIS + MaaSModelRef + MaaSAuthPolicy + MaaSSubscription)
 #   5. Setup test tokens (admin + regular user) for comprehensive testing
-#   6. Run E2E tests (API keys + subscription tests)
+#   6. Run E2E tests (API keys + subscription + models endpoint tests)
 #   7. Run deployment validation + token metadata verification
 # 
 # USAGE:
@@ -41,6 +41,7 @@
 #                    Affects deploy.sh (via --disable-tls-backend) and test env
 #   DEPLOYMENT_NAMESPACE - Namespace of MaaS API and controller (default: opendatahub)
 #   MAAS_SUBSCRIPTION_NAMESPACE - Namespace of MaaS CRs (default: models-as-a-service)
+#   MODEL_NAMESPACE - Namespace of models and MaaSModelRefs (default: llm)
 # =============================================================================
 
 set -euo pipefail
@@ -75,6 +76,7 @@ export OPERATOR_IMAGE=${OPERATOR_IMAGE:-}
 AUTHORINO_NAMESPACE="kuadrant-system"
 DEPLOYMENT_NAMESPACE="${DEPLOYMENT_NAMESPACE:-opendatahub}"
 MAAS_SUBSCRIPTION_NAMESPACE="${MAAS_SUBSCRIPTION_NAMESPACE:-models-as-a-service}"
+MODEL_NAMESPACE="${MODEL_NAMESPACE:-llm}"
 
 # Artifact collection: OpenShift CI provides ARTIFACT_DIR (docs.ci.openshift.org/docs/architecture/step-registry).
 # Files written here are collected to artifacts/<job>/<step>/ in Prow. Fallbacks: ARTIFACTS, LOG_DIR, or local reports.
@@ -214,15 +216,15 @@ deploy_models() {
     fi
 
     # Deploy all at once so dependencies resolve correctly
-    # Sample kustomizations hardcode namespace: models-as-a-service; override to $MAAS_SUBSCRIPTION_NAMESPACE
+    # E2E test fixtures kustomization hardcodes namespace: models-as-a-service; override to $MAAS_SUBSCRIPTION_NAMESPACE
     # so CRs land in the correct namespace.
-    if ! (cd "$PROJECT_ROOT" && kustomize build docs/samples/maas-system/ | \
+    if ! (cd "$PROJECT_ROOT" && kustomize build test/e2e/fixtures/ | \
             sed "s/namespace: models-as-a-service/namespace: $MAAS_SUBSCRIPTION_NAMESPACE/g" | \
             kubectl apply -f -); then
-        echo "❌ ERROR: Failed to deploy MaaS system"
+        echo "❌ ERROR: Failed to deploy MaaS system with e2e fixtures"
         exit 1
     fi
-    echo "✅ MaaS system deployed (free + premium tiers)"
+    echo "✅ MaaS system deployed (free + premium + e2e test fixtures)"
 
     echo "Waiting for models to be ready..."
     if ! oc wait llminferenceservice/facebook-opt-125m-simulated -n llm --for=condition=Ready --timeout=300s; then
@@ -239,53 +241,41 @@ deploy_models() {
     fi
     echo "✅ Simulator models ready"
 
-    # TODO: Currently waits for  ever and bounces controller (seems like they are not reconciled even after llmisvc are reported as up)
+    # Wait for MaaSModelRefs to transition to Ready phase.
+    # The controller now properly handles the race condition where MaaSModelRef is created
+    # before KServe creates the HTTPRoute (sets Pending, then Ready when HTTPRoute watch triggers).
     echo "Waiting for MaaSModelRefs to be Ready..."
-    local retries=0
+    local timeout=300  # 5 minutes - sufficient for KServe to create HTTPRoutes
+    local deadline=$((SECONDS + timeout))
     local all_ready=false
-    while [[ $retries -lt 30 ]]; do
+    local found_any=false
+
+    while [[ $SECONDS -lt $deadline ]]; do
         all_ready=true
+        found_any=false
         while IFS= read -r phase; do
+            found_any=true
             if [[ "$phase" != "Ready" ]]; then
                 all_ready=false
                 break
             fi
-        done < <(oc get maasmodelrefs -n llm -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null)
-        if $all_ready && [[ -n "$(oc get maasmodelrefs -n llm -o name 2>/dev/null)" ]]; then
+        done < <(oc get maasmodelrefs -n "$MODEL_NAMESPACE" -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null)
+
+        if $found_any && $all_ready; then
+            echo "✅ MaaSModelRefs ready"
             break
         fi
-        retries=$((retries + 1))
+
         sleep 5
     done
 
-    if ! $all_ready; then
-        # TODO: Remove this workaround once maas-controller reconcile logic is correct.
-        # Controller can get stuck in a bad state forever; bouncing may unstick it.
-        echo "  MaaSModelRefs not ready after ${retries} retries, bouncing maas-controller..."
-        kubectl rollout restart deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" 2>/dev/null || true
-        kubectl rollout status deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --timeout=120s 2>/dev/null || true
-        echo "  Retrying MaaSModelRefs wait..."
-        retries=0
-        while [[ $retries -lt 30 ]]; do
-            all_ready=true
-            while IFS= read -r phase; do
-                if [[ "$phase" != "Ready" ]]; then
-                    all_ready=false
-                    break
-                fi
-            done < <(oc get maasmodelrefs -n llm -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null)
-            if $all_ready && [[ -n "$(oc get maasmodelrefs -n llm -o name 2>/dev/null)" ]]; then
-                break
-            fi
-            retries=$((retries + 1))
-            sleep 5
-        done
-    fi
-
-    if $all_ready; then
-        echo "✅ MaaSModelRefs ready"
-    else
-        echo "⚠️  WARNING: MaaSModelRefs still not ready after bounce, continuing anyway"
+    if ! $found_any || ! $all_ready; then
+        echo "❌ ERROR: MaaSModelRefs did not reach Ready state within ${timeout}s"
+        echo "Dumping MaaSModelRef status:"
+        oc get maasmodelrefs -n "$MODEL_NAMESPACE" -o yaml || true
+        echo "Dumping controller logs:"
+        kubectl logs deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --tail=100 || true
+        exit 1
     fi
 
     wait_for_auth_policies_enforced
@@ -415,7 +405,7 @@ setup_premium_test_token() {
 }
 
 run_e2e_tests() {
-    echo "-- E2E Tests (API Keys + Subscription) --"
+    echo "-- E2E Tests (API Keys + Subscription + Models Endpoint) --"
 
     # Note: setup_premium_test_token() is called earlier in main execution
     # (Phase 1: Admin Setup) while still logged in as system:admin
@@ -429,7 +419,7 @@ run_e2e_tests() {
     # from its own namespace, but models are deployed in 'llm' namespace.
     # TODO: Fix maas-api to list MaaSModelRefs from ALL namespaces (pass "" to ListFromMaaSModelRefLister)
     export MODEL_NAME="facebook-opt-125m-simulated"
-    export E2E_MODEL_NAMESPACE="llm"
+    export E2E_MODEL_NAMESPACE="$MODEL_NAMESPACE"
     # TOKEN and ADMIN_OC_TOKEN are already exported by setup_test_tokens()
 
     local test_dir="$PROJECT_ROOT/test/e2e"
@@ -454,15 +444,16 @@ run_e2e_tests() {
     echo "  - ADMIN_OC_TOKEN: $(echo "${ADMIN_OC_TOKEN:-not set}" | cut -c1-20)..."
     echo "  - GATEWAY_HOST: ${GATEWAY_HOST}"
 
-    # Run all e2e tests: API keys, subscription, and namespace scoping tests
+    # Run all e2e tests: API keys, subscription, models endpoint, and namespace scoping tests
     if ! PYTHONPATH="$test_dir:${PYTHONPATH:-}" pytest \
         -v --maxfail=5 --disable-warnings \
         --junitxml="$xml" \
         --html="$html" --self-contained-html \
         --capture=tee-sys --show-capture=all --log-level=INFO \
         "$test_dir/tests/test_api_keys.py" \
-        "$test_dir/tests/test_subscription.py"; then
-        # "$test_dir/tests/test_namespace_scoping.py" \
+        "$test_dir/tests/test_namespace_scoping.py" \
+        "$test_dir/tests/test_subscription.py" \
+        "$test_dir/tests/test_models_endpoint.py" ; then 
         echo "❌ ERROR: E2E tests failed"
         exit 1
     fi
