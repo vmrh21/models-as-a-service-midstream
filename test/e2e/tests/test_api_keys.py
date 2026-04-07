@@ -40,6 +40,18 @@ from conftest import TLS_VERIFY
 log = logging.getLogger(__name__)
 
 
+@pytest.fixture
+def model_completions_url(model_v1: str) -> str:
+    """URL for completions endpoint."""
+    return f"{model_v1}/completions"
+
+
+@pytest.fixture
+def inference_model_name() -> str:
+    """Model name for inference requests. Override with INFERENCE_MODEL_NAME env var."""
+    return os.environ.get("INFERENCE_MODEL_NAME", "facebook/opt-125m")
+
+
 class TestAPIKeyCRUD:
     """Tests 1-3: Create, list, and revoke API keys."""
 
@@ -434,16 +446,6 @@ class TestAPIKeyExpiration:
 class TestAPIKeyModelInference:
     """Tests 11-15: Using API keys for model inference via gateway."""
 
-    @pytest.fixture
-    def model_completions_url(self, model_v1: str) -> str:
-        """URL for completions endpoint."""
-        return f"{model_v1}/completions"
-
-    @pytest.fixture
-    def inference_model_name(self) -> str:
-        """Model name for inference requests. Override with INFERENCE_MODEL_NAME env var."""
-        return os.environ.get("INFERENCE_MODEL_NAME", "facebook/opt-125m")
-
     def test_api_key_model_access_success(
         self,
         model_completions_url: str,
@@ -619,3 +621,442 @@ class TestAPIKeyModelInference:
             print(f"[inference] Chat completions returned {r.status_code}: {r.text[:200]}")
             # Don't fail - chat may not be supported
             pytest.skip(f"Chat completions returned {r.status_code}")
+
+
+class TestAPIKeyRevocationE2E:
+    """End-to-end revocation tests: double revoke, nonexistent key, bulk revoke propagation, remint after revoke."""
+
+    def test_double_revoke_returns_404(self, api_keys_base_url: str, headers: dict):
+        """Revoking the same key twice should return 404 on the second attempt."""
+        # Create a key
+        r_create = requests.post(
+            api_keys_base_url, headers=headers, json={"name": "test-double-revoke"}, timeout=30, verify=TLS_VERIFY
+        )
+        assert r_create.status_code in (200, 201), f"Failed to create key: {r_create.text}"
+        key_id = r_create.json()["id"]
+
+        # First revoke succeeds
+        r1 = requests.delete(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r1.status_code == 200
+        assert r1.json().get("status") == "revoked"
+
+        # Second revoke returns 404 (key is no longer active)
+        r2 = requests.delete(f"{api_keys_base_url}/{key_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r2.status_code == 404, f"Expected 404 on double revoke, got {r2.status_code}: {r2.text}"
+        print(f"[revoke] Double revoke correctly returns 404 for key {key_id}")
+
+    def test_revoke_nonexistent_key_returns_404(self, api_keys_base_url: str, headers: dict):
+        """Revoking a key ID that doesn't exist should return 404."""
+        r = requests.delete(
+            f"{api_keys_base_url}/nonexistent-uuid-12345", headers=headers, timeout=30, verify=TLS_VERIFY
+        )
+        assert r.status_code == 404, f"Expected 404 for nonexistent key, got {r.status_code}: {r.text}"
+        print("[revoke] Nonexistent key correctly returns 404")
+
+    def test_revoke_then_create_new_key_works(
+        self,
+        api_keys_base_url: str,
+        model_completions_url: str,
+        headers: dict,
+        inference_model_name: str,
+    ):
+        """After revoking a key, a newly created key should still work for inference."""
+        designated = os.environ.get("E2E_SIMULATOR_SUBSCRIPTION", "simulator-subscription")
+
+        # Create key A
+        r_a = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-revoke-remint-a", "subscription": designated},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_a.status_code in (200, 201), f"Failed to create key A: {r_a.text}"
+        key_a = r_a.json()["key"]
+        key_a_id = r_a.json()["id"]
+
+        # Revoke key A
+        r_revoke = requests.delete(f"{api_keys_base_url}/{key_a_id}", headers=headers, timeout=30, verify=TLS_VERIFY)
+        assert r_revoke.status_code == 200
+
+        # Create key B (new key after revocation)
+        r_b = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={"name": "test-revoke-remint-b", "subscription": designated},
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_b.status_code in (200, 201), f"Failed to create key B: {r_b.text}"
+        key_b = r_b.json()["key"]
+
+        # Poll until revoked key A is rejected (revocation may take time to propagate)
+        max_wait = 30
+        poll_interval = 0.5
+        deadline = time.monotonic() + max_wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            r_a_inf = requests.post(
+                model_completions_url,
+                headers={"Authorization": f"Bearer {key_a}", "Content-Type": "application/json"},
+                json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+                timeout=min(remaining, 10),
+                verify=TLS_VERIFY,
+            )
+            if r_a_inf.status_code == 403:
+                break
+            time.sleep(poll_interval)
+        assert r_a_inf.status_code == 403, (
+            f"Revoked key A should be rejected within {max_wait}s, got {r_a_inf.status_code}"
+        )
+
+        # Key B should work (200)
+        r_b_inf = requests.post(
+            model_completions_url,
+            headers={"Authorization": f"Bearer {key_b}", "Content-Type": "application/json"},
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+        assert r_b_inf.status_code == 200, f"New key B should work, got {r_b_inf.status_code}: {r_b_inf.text}"
+        print("[revoke] Revoked key A rejected, new key B works — remint after revoke succeeds")
+
+    def test_individual_revoke_multiple_keys(self, api_keys_base_url: str, headers: dict):
+        """Create multiple keys and revoke each individually — verifies per-key DELETE returns 200."""
+        designated = os.environ.get("E2E_SIMULATOR_SUBSCRIPTION", "simulator-subscription")
+
+        # Create 3 keys to revoke
+        key_ids = []
+        for i in range(3):
+            r = requests.post(
+                api_keys_base_url,
+                headers=headers,
+                json={"name": f"test-bulk-api-{i}", "subscription": designated},
+                timeout=30,
+                verify=TLS_VERIFY,
+            )
+            assert r.status_code in (200, 201), f"Failed to create key {i}: {r.text}"
+            key_ids.append(r.json()["id"])
+
+        # Individually revoke them so we don't nuke the session key
+        for kid in key_ids:
+            r = requests.delete(f"{api_keys_base_url}/{kid}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r.status_code == 200, f"Failed to revoke key {kid}: {r.text}"
+
+        print(f"[bulk-revoke] Individually revoked {len(key_ids)} keys")
+
+    def test_revoke_keys_rejected_at_gateway(
+        self,
+        api_keys_base_url: str,
+        model_completions_url: str,
+        headers: dict,
+        inference_model_name: str,
+    ):
+        """After individually revoking keys, they should be rejected at the gateway."""
+        designated = os.environ.get("E2E_SIMULATOR_SUBSCRIPTION", "simulator-subscription")
+
+        # Create 3 keys, capturing plaintext and IDs
+        keys = []
+        for i in range(3):
+            r = requests.post(
+                api_keys_base_url,
+                headers=headers,
+                json={"name": f"test-revoke-gw-{i}", "subscription": designated},
+                timeout=30,
+                verify=TLS_VERIFY,
+            )
+            assert r.status_code in (200, 201), f"Failed to create key {i}: {r.text}"
+            keys.append({"id": r.json()["id"], "key": r.json()["key"]})
+
+        # Smoke-test: verify at least one key works before revocation
+        r_smoke = requests.post(
+            model_completions_url,
+            headers={"Authorization": f"Bearer {keys[0]['key']}", "Content-Type": "application/json"},
+            json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+            timeout=60,
+            verify=TLS_VERIFY,
+        )
+        assert r_smoke.status_code == 200, (
+            f"Key should work before revoke, got {r_smoke.status_code}: {r_smoke.text}"
+        )
+
+        # Individually revoke all 3 keys (not bulk-revoke, to avoid nuking session key)
+        for k in keys:
+            r = requests.delete(f"{api_keys_base_url}/{k['id']}", headers=headers, timeout=30, verify=TLS_VERIFY)
+            assert r.status_code == 200, f"Failed to revoke key {k['id']}: {r.text}"
+
+        # Poll until all revoked keys are rejected at the gateway
+        max_wait = 30
+        poll_interval = 0.5
+        for i, k in enumerate(keys):
+            deadline = time.monotonic() + max_wait
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                r_inf = requests.post(
+                    model_completions_url,
+                    headers={"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"},
+                    json={"model": inference_model_name, "prompt": "Test", "max_tokens": 5},
+                    timeout=min(remaining, 10),
+                    verify=TLS_VERIFY,
+                )
+                if r_inf.status_code == 403:
+                    break
+                time.sleep(poll_interval)
+            assert r_inf.status_code == 403, (
+                f"Key {i} should be rejected within {max_wait}s after revoke, got {r_inf.status_code}: {r_inf.text}"
+            )
+        print("[revoke] All 3 keys correctly rejected at gateway after individual revocation")
+
+
+class TestEphemeralKeyCleanup:
+    """Tests for ephemeral API key cleanup (CronJob + internal endpoint).
+
+    Validates that:
+    - Ephemeral keys can be created with short expiration
+    - The cleanup CronJob exists and is correctly configured
+    - Triggering cleanup does not delete active (non-expired) ephemeral keys
+    - Cleanup returns a well-formed response with deletedCount
+
+    The cleanup endpoint (POST /internal/v1/api-keys/cleanup) is cluster-internal
+    and not exposed on the public Route. These tests trigger it via the CronJob
+    mechanism (kubectl create job --from=cronjob/maas-api-key-cleanup) or via
+    oc exec into the maas-api pod.
+
+    Environment Variables:
+    - DEPLOYMENT_NAMESPACE: Namespace where maas-api is deployed (default: opendatahub)
+    """
+
+    @pytest.fixture
+    def deployment_namespace(self) -> str:
+        return os.environ.get("DEPLOYMENT_NAMESPACE", "opendatahub")
+
+    def test_cronjob_exists_and_configured(self, deployment_namespace: str):
+        """Verify the maas-api-key-cleanup CronJob exists with expected configuration."""
+        import subprocess as sp
+
+        result = sp.run(
+            ["oc", "get", "cronjob", "maas-api-key-cleanup",
+             "-n", deployment_namespace, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"CronJob maas-api-key-cleanup not found in {deployment_namespace}: "
+                f"{result.stderr.strip()}"
+            )
+
+        import json as _json
+        cj = _json.loads(result.stdout)
+        spec = cj["spec"]
+
+        # Verify schedule (every 15 minutes)
+        assert spec["schedule"] == "*/15 * * * *", \
+            f"Expected schedule '*/15 * * * *', got '{spec['schedule']}'"
+
+        # Verify concurrency policy
+        assert spec["concurrencyPolicy"] == "Forbid", \
+            "CronJob should use Forbid concurrency policy"
+
+        # Verify the curl command targets the internal cleanup endpoint
+        containers = spec["jobTemplate"]["spec"]["template"]["spec"]["containers"]
+        assert len(containers) >= 1
+        container_spec = containers[0]
+        # Command is in the 'command' field (shell script via /bin/sh -c)
+        cmd_parts = container_spec.get("command", [])
+        cmd_str = " ".join(cmd_parts)
+        assert "/internal/v1/api-keys/cleanup" in cmd_str, \
+            f"CronJob command should target cleanup endpoint, got: {cmd_str}"
+
+        # Verify security context (non-root, read-only fs)
+        sec_ctx = container_spec.get("securityContext", {})
+        assert sec_ctx.get("runAsNonRoot", False) is True, \
+            "Cleanup container should run as non-root"
+        assert sec_ctx.get("readOnlyRootFilesystem", False) is True, \
+            "Cleanup container should have read-only root filesystem"
+
+        print(f"[cleanup] CronJob validated: schedule={spec['schedule']}, "
+              f"concurrency={spec['concurrencyPolicy']}")
+
+    def test_cleanup_networkpolicy_exists(self, deployment_namespace: str):
+        """Verify the cleanup NetworkPolicy exists and restricts cleanup pod access."""
+        import subprocess as sp
+
+        result = sp.run(
+            ["oc", "get", "networkpolicy", "maas-api-cleanup-restrict",
+             "-n", deployment_namespace, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"NetworkPolicy maas-api-cleanup-restrict not found in "
+                f"{deployment_namespace}: {result.stderr.strip()}"
+            )
+
+        import json as _json
+        np = _json.loads(result.stdout)
+        spec = np["spec"]
+
+        # Verify it targets cleanup pods
+        selector = spec.get("podSelector", {}).get("matchLabels", {})
+        assert selector.get("app") == "maas-api-cleanup", \
+            f"NetworkPolicy should target app=maas-api-cleanup, got: {selector}"
+
+        # Verify policy types include both Egress and Ingress
+        policy_types = spec.get("policyTypes", [])
+        assert "Egress" in policy_types, "NetworkPolicy should control egress"
+        assert "Ingress" in policy_types, "NetworkPolicy should control ingress"
+
+        # Verify ingress is blocked (empty list)
+        assert spec.get("ingress") == [] or spec.get("ingress") is None, \
+            "Cleanup pods should have no inbound traffic"
+
+        print("[cleanup] NetworkPolicy validated: cleanup pods restricted to maas-api egress only")
+
+    def test_create_ephemeral_key(self, api_keys_base_url: str, headers: dict):
+        """Create an ephemeral key and verify it appears in search with includeEphemeral."""
+        # Create ephemeral key with short expiration (30 minutes)
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "e2e-ephemeral-cleanup-test",
+                "ephemeral": True,
+                "expiresIn": "30m",
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), \
+            f"Expected 200/201 creating ephemeral key, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert data.get("ephemeral") is True, "Key should be marked as ephemeral"
+        key_id = data["id"]
+        print(f"[cleanup] Created ephemeral key: id={key_id}, expiresAt={data.get('expiresAt')}")
+
+        # Verify ephemeral key appears in search with includeEphemeral filter
+        r_search = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"], "includeEphemeral": True},
+                "pagination": {"limit": 50, "offset": 0},
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_search.status_code == 200
+        items = r_search.json().get("items") or r_search.json().get("data") or []
+        found_ids = [item["id"] for item in items]
+        assert key_id in found_ids, \
+            f"Ephemeral key {key_id} should appear in search with includeEphemeral=true"
+
+        # Verify ephemeral key is excluded from default search (without includeEphemeral)
+        r_default = requests.post(
+            f"{api_keys_base_url}/search",
+            headers=headers,
+            json={
+                "filters": {"status": ["active"]},
+                "pagination": {"limit": 50, "offset": 0},
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_default.status_code == 200
+        default_items = r_default.json().get("items") or r_default.json().get("data") or []
+        default_ids = [item["id"] for item in default_items]
+        assert key_id not in default_ids, \
+            "Ephemeral key should be excluded from default search (includeEphemeral defaults to false)"
+
+        print(f"[cleanup] Ephemeral key visibility verified: visible with filter, hidden by default")
+
+    def test_trigger_cleanup_preserves_active_keys(
+        self, api_keys_base_url: str, headers: dict, deployment_namespace: str,
+    ):
+        """Trigger cleanup and verify active ephemeral keys are NOT deleted.
+
+        Creates an ephemeral key, triggers cleanup via oc exec into maas-api pod,
+        and asserts the active key survives cleanup (only expired keys beyond the
+        30-minute grace period are deleted).
+        """
+        import subprocess as sp
+
+        # Create an ephemeral key with 1 hour expiration (won't expire during test)
+        r = requests.post(
+            api_keys_base_url,
+            headers=headers,
+            json={
+                "name": "e2e-cleanup-survival-test",
+                "ephemeral": True,
+                "expiresIn": "1h",
+            },
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r.status_code in (200, 201), \
+            f"Expected 200/201, got {r.status_code}: {r.text}"
+        key_id = r.json()["id"]
+        print(f"[cleanup] Created ephemeral key for survival test: id={key_id}")
+
+        # Trigger cleanup via oc exec into maas-api pod
+        # This calls the internal endpoint directly, same as the CronJob does
+        get_pod = sp.run(
+            ["oc", "get", "pods", "-n", deployment_namespace,
+             "-l", "app.kubernetes.io/name=maas-api",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True, text=True,
+        )
+        if get_pod.returncode != 0 or not get_pod.stdout.strip():
+            pytest.skip(
+                f"Cannot find maas-api pod in {deployment_namespace}: "
+                f"{get_pod.stderr.strip()}"
+            )
+
+        pod_name = get_pod.stdout.strip()
+        print(f"[cleanup] Triggering cleanup via oc exec into {pod_name}")
+
+        cleanup_result = sp.run(
+            ["oc", "exec", pod_name, "-n", deployment_namespace, "--",
+             "curl", "-sf", "-X", "POST",
+             "http://localhost:8080/internal/v1/api-keys/cleanup"],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        if cleanup_result.returncode != 0:
+            # curl may not be available in the maas-api container; try wget
+            cleanup_result = sp.run(
+                ["oc", "exec", pod_name, "-n", deployment_namespace, "--",
+                 "wget", "-q", "-O-", "--post-data=",
+                 "http://localhost:8080/internal/v1/api-keys/cleanup"],
+                capture_output=True, text=True, timeout=30,
+            )
+
+        if cleanup_result.returncode != 0:
+            pytest.skip(
+                f"Cannot exec into maas-api pod to trigger cleanup "
+                f"(neither curl nor wget available): {cleanup_result.stderr.strip()}"
+            )
+
+        import json as _json
+        cleanup_resp = _json.loads(cleanup_result.stdout)
+        deleted_count = cleanup_resp.get("deletedCount", -1)
+        assert deleted_count >= 0, \
+            f"Cleanup response should have non-negative deletedCount, got: {cleanup_resp}"
+        print(f"[cleanup] Cleanup completed: deletedCount={deleted_count}, "
+              f"message={cleanup_resp.get('message')}")
+
+        # Verify our active ephemeral key survived cleanup
+        r_get = requests.get(
+            f"{api_keys_base_url}/{key_id}",
+            headers=headers,
+            timeout=30,
+            verify=TLS_VERIFY,
+        )
+        assert r_get.status_code == 200, \
+            f"Active ephemeral key {key_id} should survive cleanup, got {r_get.status_code}"
+        assert r_get.json().get("status") == "active", \
+            f"Key should still be active after cleanup, got: {r_get.json().get('status')}"
+        print(f"[cleanup] Active ephemeral key {key_id} survived cleanup (correct behavior)")

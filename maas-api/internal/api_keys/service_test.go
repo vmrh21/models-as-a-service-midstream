@@ -43,8 +43,8 @@ func TestValidateAPIKey_ValidKey(t *testing.T) {
 	ctx := context.Background()
 	svc, store := createTestService(t)
 
-	// Create a valid API key
-	keyID := "test-key-id"
+	// Create a valid API key with UUID (matches production database behavior)
+	keyID := "550e8400-e29b-41d4-a716-446655440000"
 	plainKey, hash := createTestAPIKey(t)
 	username := "alice"
 	groups := []string{"tier-premium", "system:authenticated"}
@@ -58,7 +58,7 @@ func TestValidateAPIKey_ValidKey(t *testing.T) {
 	require.NotNil(t, result)
 
 	assert.True(t, result.Valid)
-	assert.Equal(t, username, result.UserID)
+	assert.Equal(t, keyID, result.UserID) // UserID is the database-assigned key ID (UUID)
 	assert.Equal(t, username, result.Username)
 	assert.Equal(t, keyID, result.KeyID)
 	assert.Equal(t, groups, result.Groups)
@@ -108,7 +108,7 @@ func TestValidateAPIKey_RevokedKey(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create and immediately revoke a key
-	keyID := "revoked-key-id"
+	keyID := "550e8400-e29b-41d4-a716-446655440001"
 	plainKey, hash := createTestAPIKey(t)
 	username := "bob"
 	groups := []string{"tier-free"}
@@ -134,7 +134,7 @@ func TestValidateAPIKey_ExpiredKey(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create a key that's already expired
-	keyID := "expired-key-id"
+	keyID := "550e8400-e29b-41d4-a716-446655440002"
 	plainKey, hash := createTestAPIKey(t)
 	username := "charlie"
 	groups := []string{"tier-basic"}
@@ -157,7 +157,7 @@ func TestValidateAPIKey_EmptyGroups(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create a key with no groups (nil)
-	keyID := "no-groups-key"
+	keyID := "550e8400-e29b-41d4-a716-446655440003"
 	plainKey, hash := createTestAPIKey(t)
 	username := "dave"
 
@@ -170,7 +170,7 @@ func TestValidateAPIKey_EmptyGroups(t *testing.T) {
 	require.NotNil(t, result)
 
 	assert.True(t, result.Valid)
-	assert.Equal(t, username, result.UserID)
+	assert.Equal(t, keyID, result.UserID) // UserID is the database-assigned key ID (UUID)
 	assert.NotNil(t, result.Groups, "Groups should be empty array, not nil")
 	assert.Empty(t, result.Groups, "Groups should be empty")
 }
@@ -180,7 +180,7 @@ func TestValidateAPIKey_UpdatesLastUsed(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create a valid API key
-	keyID := "last-used-key"
+	keyID := "550e8400-e29b-41d4-a716-446655440004"
 	plainKey, hash := createTestAPIKey(t)
 	username := "eve"
 	groups := []string{"tier-enterprise"}
@@ -216,7 +216,7 @@ func TestGetAPIKey(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create a key
-	keyID := "get-test-key"
+	keyID := "550e8400-e29b-41d4-a716-446655440005"
 	_, hash := createTestAPIKey(t)
 	username := "alice"
 	keyName := "Alice's Key"
@@ -249,7 +249,7 @@ func TestRevokeAPIKey(t *testing.T) {
 	svc, store := createTestService(t)
 
 	// Create a key
-	keyID := "revoke-test-key"
+	keyID := "550e8400-e29b-41d4-a716-446655440006"
 	_, hash := createTestAPIKey(t)
 	username := "bob"
 
@@ -269,6 +269,162 @@ func TestRevokeAPIKey(t *testing.T) {
 	meta, err = store.Get(ctx, keyID)
 	require.NoError(t, err)
 	assert.Equal(t, api_keys.StatusRevoked, meta.Status)
+}
+
+// ============================================================
+// REVOKE API KEY - ERROR PATHS
+// ============================================================
+
+// TestRevokeAPIKey_NotFound verifies that revoking a non-existent key
+// propagates ErrKeyNotFound from the store through the service layer.
+func TestRevokeAPIKey_NotFound(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := createTestService(t)
+
+	err := svc.RevokeAPIKey(ctx, "nonexistent-key-id")
+	require.ErrorIs(t, err, api_keys.ErrKeyNotFound)
+}
+
+// TestRevokeAPIKey_AlreadyRevoked verifies that revoking a key twice
+// returns ErrKeyNotFound on the second attempt (matches PostgreSQL behavior:
+// UPDATE ... WHERE status='active' affects 0 rows).
+func TestRevokeAPIKey_AlreadyRevoked(t *testing.T) {
+	ctx := context.Background()
+	svc, store := createTestService(t)
+
+	keyID := "double-revoke-key"
+	_, hash := createTestAPIKey(t)
+	require.NoError(t, store.AddKey(ctx, "alice", keyID, hash, "Double Revoke", "", nil, "default-sub", nil, false))
+
+	// First revoke succeeds
+	require.NoError(t, svc.RevokeAPIKey(ctx, keyID))
+
+	// Second revoke returns not found (key is no longer active)
+	err := svc.RevokeAPIKey(ctx, keyID)
+	require.ErrorIs(t, err, api_keys.ErrKeyNotFound)
+}
+
+// TestRevokeAPIKey_ThenValidate verifies the full revoke-then-validate flow:
+// after revoking via the service layer, ValidateAPIKey should return invalid
+// with reason "key revoked or expired".
+func TestRevokeAPIKey_ThenValidate(t *testing.T) {
+	ctx := context.Background()
+	svc, store := createTestService(t)
+
+	keyID := "revoke-validate-key"
+	plainKey, hash := createTestAPIKey(t)
+	require.NoError(t, store.AddKey(ctx, "eve", keyID, hash, "Revoke Then Validate", "", []string{"users"}, "default-sub", nil, false))
+
+	// Revoke via service
+	require.NoError(t, svc.RevokeAPIKey(ctx, keyID))
+
+	// Validate should report the key as invalid
+	result, err := svc.ValidateAPIKey(ctx, plainKey)
+	require.NoError(t, err)
+	assert.False(t, result.Valid)
+	assert.Equal(t, "key revoked or expired", result.Reason)
+}
+
+// ============================================================
+// BULK REVOKE API KEYS (SERVICE LAYER)
+// ============================================================
+
+// TestBulkRevokeAPIKeys tests the service-level BulkRevokeAPIKeys function
+// which revokes all active keys for a given username.
+func TestBulkRevokeAPIKeys(t *testing.T) {
+	// Verify that bulk revoke revokes all active keys for the target user
+	// and returns the correct count.
+	t.Run("HappyPath", func(t *testing.T) {
+		ctx := context.Background()
+		svc, store := createTestService(t)
+
+		// Create 3 keys for alice
+		for i := range 3 {
+			_, hash := createTestAPIKey(t)
+			id := "bulk-key-" + string(rune('a'+i))
+			require.NoError(t, store.AddKey(ctx, "alice", id, hash, "Key "+id, "", nil, "default-sub", nil, false))
+		}
+
+		count, err := svc.BulkRevokeAPIKeys(ctx, "alice")
+		require.NoError(t, err)
+		assert.Equal(t, 3, count)
+
+		// Verify all keys are revoked
+		for i := range 3 {
+			id := "bulk-key-" + string(rune('a'+i))
+			meta, err := store.Get(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, api_keys.StatusRevoked, meta.Status, "key %s should be revoked", id)
+		}
+	})
+
+	// Verify that bulk revoke for a user with no keys returns count=0 and no error.
+	t.Run("NoKeysToRevoke", func(t *testing.T) {
+		ctx := context.Background()
+		svc, _ := createTestService(t)
+
+		count, err := svc.BulkRevokeAPIKeys(ctx, "nobody")
+		require.NoError(t, err)
+		assert.Equal(t, 0, count)
+	})
+
+	// Verify that calling bulk revoke twice is idempotent:
+	// the second call returns count=0 because all keys are already revoked.
+	t.Run("Idempotent", func(t *testing.T) {
+		ctx := context.Background()
+		svc, store := createTestService(t)
+
+		_, hash := createTestAPIKey(t)
+		require.NoError(t, store.AddKey(ctx, "bob", "idem-key", hash, "Idempotent Key", "", nil, "default-sub", nil, false))
+
+		count, err := svc.BulkRevokeAPIKeys(ctx, "bob")
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+
+		// Second call: no active keys left
+		count, err = svc.BulkRevokeAPIKeys(ctx, "bob")
+		require.NoError(t, err)
+		assert.Equal(t, 0, count)
+	})
+
+	// Verify that empty username is rejected with an error.
+	t.Run("EmptyUsername", func(t *testing.T) {
+		ctx := context.Background()
+		svc, _ := createTestService(t)
+
+		_, err := svc.BulkRevokeAPIKeys(ctx, "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "username is required")
+	})
+}
+
+// TestBulkRevokeAPIKeys_ThenValidateAll verifies that after bulk revoking,
+// all previously valid keys are rejected by ValidateAPIKey.
+func TestBulkRevokeAPIKeys_ThenValidateAll(t *testing.T) {
+	ctx := context.Background()
+	svc, store := createTestService(t)
+
+	// Create 3 keys, keep their plaintext for validation
+	plainKeys := make([]string, 3)
+	for i := range 3 {
+		plain, hash := createTestAPIKey(t)
+		plainKeys[i] = plain
+		id := "bulk-validate-" + string(rune('a'+i))
+		require.NoError(t, store.AddKey(ctx, "carol", id, hash, "Key "+id, "", []string{"users"}, "default-sub", nil, false))
+	}
+
+	// Bulk revoke all of carol's keys
+	count, err := svc.BulkRevokeAPIKeys(ctx, "carol")
+	require.NoError(t, err)
+	assert.Equal(t, 3, count)
+
+	// Validate each key — all should be rejected
+	for i, plain := range plainKeys {
+		result, err := svc.ValidateAPIKey(ctx, plain)
+		require.NoError(t, err)
+		assert.False(t, result.Valid, "key %d should be invalid after bulk revoke", i)
+		assert.Equal(t, "key revoked or expired", result.Reason)
+	}
 }
 
 // ============================================================
@@ -588,6 +744,47 @@ func TestCreateAPIKey_Subscription(t *testing.T) {
 				assert.Empty(t, res.Keys)
 			})
 		}
+	})
+}
+
+// ============================================================
+// CLEANUP EXPIRED EPHEMERAL KEYS TESTS
+// ============================================================
+
+func TestCleanupExpiredEphemeral(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("DeletesExpiredEphemeralKeys", func(t *testing.T) {
+		svc, store := createTestService(t)
+
+		// Add active regular key
+		err := store.AddKey(ctx, "alice", "regular-1", "hash-1", "Regular", "", nil, "default-sub", nil, false)
+		require.NoError(t, err)
+
+		// Add expired ephemeral key
+		pastExpiry := time.Now().Add(-1 * time.Hour)
+		err = store.AddKey(ctx, "alice", "ephemeral-1", "hash-2", "Ephemeral", "", nil, "default-sub", &pastExpiry, true)
+		require.NoError(t, err)
+
+		count, err := svc.CleanupExpiredEphemeral(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), count)
+
+		// Ephemeral key should be gone
+		_, err = store.Get(ctx, "ephemeral-1")
+		require.ErrorIs(t, err, api_keys.ErrKeyNotFound)
+
+		// Regular key should still exist
+		_, err = store.Get(ctx, "regular-1")
+		require.NoError(t, err)
+	})
+
+	t.Run("ReturnsZeroWhenNoExpiredKeys", func(t *testing.T) {
+		svc, _ := createTestService(t)
+
+		count, err := svc.CleanupExpiredEphemeral(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), count)
 	})
 }
 
