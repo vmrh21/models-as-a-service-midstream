@@ -251,10 +251,18 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*ValidationRe
 		}, nil
 	}
 
+	// Validate metadata.ID is a syntactically valid UUID (fail-closed defense-in-depth)
+	// Database should always return valid UUIDs, but verify to prevent malformed IDs
+	// from being used in cache keys or authorization decisions
+	if _, err := uuid.Parse(metadata.ID); err != nil {
+		s.logger.Error("API key has invalid UUID format", "key_id", metadata.ID, "error", err)
+		return nil, fmt.Errorf("database integrity error: invalid key ID format: %w", err)
+	}
+
 	// Success - return user identity and groups for Authorino
 	return &ValidationResult{
 		Valid:        true,
-		UserID:       metadata.Username,
+		UserID:       metadata.ID, // Database-assigned UUID (immutable, collision-resistant)
 		Username:     metadata.Username,
 		KeyID:        metadata.ID,
 		Groups:       groups, // Original user groups for subscription-based authorization
@@ -285,4 +293,15 @@ func (s *Service) BulkRevokeAPIKeys(ctx context.Context, username string) (int, 
 		return 0, errors.New("username is required")
 	}
 	return s.store.InvalidateAll(ctx, username)
+}
+
+// CleanupExpiredEphemeral deletes expired ephemeral keys from storage.
+// Called by the internal cleanup endpoint (CronJob).
+func (s *Service) CleanupExpiredEphemeral(ctx context.Context) (int64, error) {
+	count, err := s.store.DeleteExpiredEphemeral(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup failed: %w", err)
+	}
+	s.logger.Info("Ephemeral key cleanup completed", "deletedCount", count)
+	return count, nil
 }

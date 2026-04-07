@@ -45,6 +45,7 @@ import (
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/controller/maas"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/reconciler/externalmodel"
 )
 
 var (
@@ -58,6 +59,8 @@ func init() {
 	utilruntime.Must(gatewayapiv1.Install(scheme))
 	utilruntime.Must(maasv1alpha1.AddToScheme(scheme))
 }
+
+//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;create
 
 // ensureSubscriptionNamespaceExists checks whether the subscription namespace exists
 // and creates it if missing. It checks for existence first so that the controller can
@@ -74,6 +77,12 @@ func ensureSubscriptionNamespaceExists(ctx context.Context, namespace string) er
 	_, err = clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 	if err == nil {
 		setupLog.Info("subscription namespace already exists", "namespace", namespace)
+		return nil
+	}
+	if errors.IsForbidden(err) {
+		setupLog.Info("insufficient permissions to check namespace existence, assuming it exists — "+
+			"verify that the ClusterRoleBinding references the correct namespace for the controller ServiceAccount",
+			"namespace", namespace, "error", err)
 		return nil
 	}
 	if !errors.IsNotFound(err) {
@@ -148,6 +157,8 @@ func main() {
 	var maasAPINamespace string
 	var maasSubscriptionNamespace string
 	var clusterAudience string
+	var metadataCacheTTL int64
+	var authzCacheTTL int64
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -158,6 +169,8 @@ func main() {
 	flag.StringVar(&maasAPINamespace, "maas-api-namespace", "opendatahub", "The namespace where maas-api service is deployed.")
 	flag.StringVar(&maasSubscriptionNamespace, "maas-subscription-namespace", "models-as-a-service", "The namespace to watch for MaaS CRs.")
 	flag.StringVar(&clusterAudience, "cluster-audience", "https://kubernetes.default.svc", "The OIDC audience of the cluster for TokenReview. HyperShift/ROSA clusters use a custom OIDC provider URL.")
+	flag.Int64Var(&metadataCacheTTL, "metadata-cache-ttl", 60, "TTL in seconds for Authorino metadata HTTP caching (apiKeyValidation, subscription-info).")
+	flag.Int64Var(&authzCacheTTL, "authz-cache-ttl", 60, "TTL in seconds for Authorino OPA authorization caching (auth-valid, subscription-valid, require-group-membership).")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -218,6 +231,8 @@ func main() {
 		MaaSAPINamespace: maasAPINamespace,
 		GatewayName:      gatewayName,
 		ClusterAudience:  clusterAudience,
+		MetadataCacheTTL: metadataCacheTTL,
+		AuthzCacheTTL:    authzCacheTTL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MaaSAuthPolicy")
 		os.Exit(1)
@@ -227,6 +242,17 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MaaSSubscription")
+		os.Exit(1)
+	}
+
+	if err := (&externalmodel.Reconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Log:              ctrl.Log.WithName("controllers").WithName("ExternalModel"),
+		GatewayName:      gatewayName,
+		GatewayNamespace: gatewayNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ExternalModel")
 		os.Exit(1)
 	}
 
