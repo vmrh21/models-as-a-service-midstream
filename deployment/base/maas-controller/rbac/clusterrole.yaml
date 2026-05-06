@@ -21,6 +21,7 @@ rules:
   resources:
   - endpoints
   - pods
+  - secrets
   verbs:
   - get
   - list
@@ -34,21 +35,6 @@ rules:
   - get
   - list
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resourceNames:
-  - maas-db-config
-  resources:
-  - secrets
-  verbs:
-  - get
 - apiGroups:
   - ""
   resources:
@@ -273,6 +259,18 @@ rules:
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - perses.dev
+  resources:
+  - persesdashboards
+  - persesdatasources
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
   - watch
 - apiGroups:
   - rbac.authorization.k8s.io
